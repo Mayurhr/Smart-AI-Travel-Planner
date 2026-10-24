@@ -12,7 +12,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { CurrencyCode, TravelStyle, TripPlan, TripType, CabinClass } from '../../types/travel';
-import { generateTrip } from '../../lib/api';
+import { generateTrip, generateTripSingleAgent } from '../../lib/api';
 import { formatCurrency, calculateFeasiblePlan } from '../../lib/budget';
 import { searchLocations, NormalizedLocation } from '../../lib/geocoding';
 
@@ -116,10 +116,11 @@ export const TripPlannerWizard: React.FC<TripPlannerWizardProps> = ({
   // Budget
   const [maxBudget, setMaxBudget] = useState<number>(8000); // Realistic default (e.g. ₹8,000 for Shivamogga to Goa)
   const [selectedCurrency, setSelectedCurrency] = useState<CurrencyCode>(currency);
+  const [planningEngine, setPlanningEngine] = useState<'multi_agent' | 'single_agent'>('multi_agent');
 
   // Synthesis states with dynamic stage progress
   const [isSynthesizing, setIsSynthesizing] = useState(false);
-  const [synthesisStage, setSynthesisStage] = useState('Initializing Multi-Agent DAG Swarm...');
+  const [synthesisStage, setSynthesisStage] = useState('Initializing Journey Planning Engine...');
   const [stage1Progress, setStage1Progress] = useState(0);
   const [stage2Progress, setStage2Progress] = useState(0);
   const [stage3Progress, setStage3Progress] = useState(0);
@@ -224,30 +225,49 @@ export const TripPlannerWizard: React.FC<TripPlannerWizardProps> = ({
     setStage1Progress(20);
     setStage2Progress(0);
     setStage3Progress(0);
-    setSynthesisStage(`Orchestrator: Arbitrating ${tripType === 'round_trip' ? 'Round-Trip' : 'One-Way'} corridor ${origin} ➔ ${destination}...`);
+
+    const isSingle = planningEngine === 'single_agent';
+
+    setSynthesisStage(
+      isSingle
+        ? `Single-Agent Core: Initializing unified sequential loop for ${origin} ➔ ${destination}...`
+        : `Orchestrator: Arbitrating ${tripType === 'round_trip' ? 'Round-Trip' : 'One-Way'} corridor ${origin} ➔ ${destination}...`
+    );
 
     // Live progress increments
     const t1 = setTimeout(() => {
       setStage1Progress(75);
-      setSynthesisStage('Transport Agent: Synthesizing Outbound & Return transport corridors...');
-    }, 500);
+      setSynthesisStage(
+        isSingle
+          ? 'Single-Agent: Invoking Geocoding & Transit tools sequentially...'
+          : 'Transport Agent: Synthesizing Outbound & Return transport corridors...'
+      );
+    }, 450);
 
     const t2 = setTimeout(() => {
       setStage1Progress(100);
       setStage2Progress(45);
-      setSynthesisStage('Budget Engine: Deterministic arithmetic & bilateral split allocations...');
-    }, 1100);
+      setSynthesisStage(
+        isSingle
+          ? 'Single-Agent: Querying Weather & Sanctuary Lodging tools...'
+          : 'Budget Engine: Deterministic arithmetic & bilateral split allocations...'
+      );
+    }, 1000);
 
     const t3 = setTimeout(() => {
       setStage2Progress(100);
       setStage3Progress(40);
-      setSynthesisStage(`Itinerary Agent: Curating authenticated ${destination} sights & activities...`);
-    }, 1700);
+      setSynthesisStage(
+        isSingle
+          ? `Single-Agent: Holistic generative synthesis & deterministic arithmetic audit...`
+          : `Itinerary Agent: Curating authenticated ${destination} sights & activities...`
+      );
+    }, 1600);
 
     const t4 = setTimeout(() => {
       setStage3Progress(85);
       setSynthesisStage('Finalizing complete round-trip itinerary & verified photo archives...');
-    }, 2400);
+    }, 2200);
 
     // Failsafe timer so modal NEVER stays stuck
     const failsafe = setTimeout(() => {
@@ -256,7 +276,7 @@ export const TripPlannerWizard: React.FC<TripPlannerWizardProps> = ({
     }, 19000);
 
     try {
-      const generated = await generateTrip({
+      const inputPayload = {
         destination,
         origin,
         tripType,
@@ -271,7 +291,16 @@ export const TripPlannerWizard: React.FC<TripPlannerWizardProps> = ({
         maxBudget,
         currency: selectedCurrency,
         dietaryOrAccessibility: dietary,
-      });
+      };
+
+      let generated: TripPlan;
+
+      if (isSingle) {
+        const res = await generateTripSingleAgent(inputPayload);
+        generated = res.trip;
+      } else {
+        generated = await generateTrip(inputPayload);
+      }
 
       clearTimeout(t1);
       clearTimeout(t2);
@@ -864,6 +893,64 @@ export const TripPlannerWizard: React.FC<TripPlannerWizardProps> = ({
               )}
             </div>
 
+            {/* AI Architecture Engine Selector */}
+            <div className="p-4 rounded-xl bg-white border border-[#CBD5E1] space-y-2.5">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-bold uppercase tracking-wider text-[#0F172A] flex items-center gap-1.5">
+                  <span className="material-symbols-outlined text-sm text-[#0891B2]">precision_manufacturing</span>
+                  Planning Architecture Engine (Research Benchmark)
+                </label>
+                <span className="text-[10px] font-mono text-[#64748B]">Independent Executables</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => setPlanningEngine('multi_agent')}
+                  className={`p-3 rounded-xl border text-left transition-all ${
+                    planningEngine === 'multi_agent'
+                      ? 'bg-[#EFF6FF] border-[#0891B2] shadow-xs'
+                      : 'bg-[#F8FAFC] border-[#E2E8F0] hover:bg-white'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <strong className="text-xs font-bold text-[#0F172A] flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-sm text-[#0891B2]">hub</span>
+                      Multi-Agent Swarm (Baseline)
+                    </strong>
+                    {planningEngine === 'multi_agent' && (
+                      <span className="material-symbols-outlined text-sm text-[#0891B2]">check_circle</span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-[#64748B] leading-tight">
+                    Coordinates specialized agents with parallel transit, weather, and stay co-routines.
+                  </p>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setPlanningEngine('single_agent')}
+                  className={`p-3 rounded-xl border text-left transition-all ${
+                    planningEngine === 'single_agent'
+                      ? 'bg-[#F5F3FF] border-[#7C3AED] shadow-xs'
+                      : 'bg-[#F8FAFC] border-[#E2E8F0] hover:bg-white'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <strong className="text-xs font-bold text-[#0F172A] flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-sm text-[#7C3AED]">psychology</span>
+                      Single-Agent Engine (Experiment)
+                    </strong>
+                    {planningEngine === 'single_agent' && (
+                      <span className="material-symbols-outlined text-sm text-[#7C3AED]">check_circle</span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-[#64748B] leading-tight">
+                    Single autonomous agent with unified reasoning loop and sequential tool dispatches.
+                  </p>
+                </button>
+              </div>
+            </div>
+
             {/* Review Summary */}
             <div className="p-4 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0] space-y-2 text-xs">
               <strong className="text-[#0F172A] block uppercase tracking-wider text-[11px]">
@@ -875,7 +962,7 @@ export const TripPlannerWizard: React.FC<TripPlannerWizardProps> = ({
                 <div>Dates: <strong className="text-[#0F172A]">{startDate} → {endDate}</strong></div>
                 <div>Duration: <strong className="text-[#0F172A]">{durationDays} Days</strong></div>
                 <div>Travelers: <strong className="text-[#0F172A]">{travelers} Guests</strong></div>
-                <div>Style: <strong className="text-[#0F172A] capitalize">{style}</strong></div>
+                <div>Architecture: <strong className="text-[#0891B2] capitalize">{planningEngine === 'single_agent' ? 'Single-Agent' : 'Multi-Agent'}</strong></div>
               </div>
             </div>
           </div>

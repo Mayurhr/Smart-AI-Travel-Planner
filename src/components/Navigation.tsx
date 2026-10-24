@@ -238,8 +238,10 @@ export const Navigation: React.FC<NavigationProps> = ({
                 <span className="material-symbols-outlined text-lg text-[#0891B2]">hub</span>
                 {!sidebarCollapsed && (
                   <div className="flex items-center justify-between flex-1">
-                    <span>Agent Center</span>
-                    <span className="w-2 h-2 rounded-full bg-[#0891B2]" />
+                    <span>Research & Agents</span>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-[#EFF6FF] text-[#0891B2] font-bold">
+                      Compare
+                    </span>
                   </div>
                 )}
               </div>

@@ -9,7 +9,28 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { orchestrateTripPlan, TripGenerationInput } from './src/server/agents/orchestrator';
-import { generateGeminiText } from './src/server/geminiService';
+import { executeSingleAgentPlan } from './src/server/agents/singleAgentPlanner';
+import { BENCHMARK_SCENARIOS } from './src/server/benchmarkDataset';
+import {
+  executeSingleBenchmark,
+  executePairedBenchmark,
+  executeBatchBenchmark,
+  getAllBenchmarkRecords,
+  clearBenchmarkHistory,
+  getComparativeAnalysis,
+  exportBenchmarksAsCsv,
+  exportComparisonAsCsv,
+  exportArchitectureSpecificAsCsv,
+  exportMultiAgentMetricsAsCsv,
+  exportSingleAgentMetricsAsCsv,
+  exportTestCaseResultsAsCsv,
+  exportBenchmarksAsJson,
+  getRegisteredMultiAgentPerformance,
+  getSingleAgentPerformanceSummary,
+  METRIC_REGISTRY,
+  ALGORITHM_COMPLEXITY_COMPARISONS,
+} from './src/server/benchmarkRunner';
+import { generateGeminiText, extractTravelDocumentWithGemini } from './src/server/geminiService';
 import { calculateBudgetTotals, calculateCategoryBreakdown, calculateBilateralSplit } from './src/lib/budget';
 import { fetchLiveExchangeRates } from './src/lib/currencyService';
 import { searchLocations } from './src/lib/geocoding';
@@ -64,8 +85,37 @@ app.post('/api/trips/generate', async (req: Request, res: Response) => {
     tripsStore.unshift(trip);
     res.status(201).json({ success: true, trip });
   } catch (error) {
-    console.error('Failed to generate trip:', error);
+    console.error('Failed to generate trip (Multi-Agent):', error);
     res.status(500).json({ success: false, error: 'Failed to synthesize travel plan' });
+  }
+});
+
+/**
+ * 2b. POST /api/trips/generate-single
+ * Genuine Single-Agent Planner synthesizes a complete trip
+ */
+app.post('/api/trips/generate-single', async (req: Request, res: Response) => {
+  try {
+    const input: TripGenerationInput = req.body || {};
+    const trace = await executeSingleAgentPlan(input);
+    tripsStore.unshift(trace.trip);
+    res.status(201).json({
+      success: true,
+      trip: trace.trip,
+      trace: {
+        toolSteps: trace.toolSteps,
+        wallClockDurationMs: trace.wallClockDurationMs,
+        criticalPathDurationMs: trace.criticalPathDurationMs,
+        timeToFirstResponseMs: trace.timeToFirstResponseMs,
+        modelRequestsCount: trace.modelRequestsCount,
+        toolCallsCount: trace.toolCallsCount,
+        totalTokens: trace.totalTokens,
+        estimatedCostUsd: trace.estimatedCostUsd,
+      },
+    });
+  } catch (error) {
+    console.error('Failed to generate trip (Single-Agent):', error);
+    res.status(500).json({ success: false, error: 'Failed to execute single-agent planner' });
   }
 });
 
@@ -609,62 +659,152 @@ app.post('/api/hotels/search', (req: Request, res: Response) => {
 
 /**
  * 13. POST /api/documents/extract
- * Document OCR extraction
+ * Real Multimodal Gemini 3.8 Flash Document OCR Extraction
+ * Supports PDF, PNG, JPG/JPEG, and WEBP files up to 15MB
  */
 app.post('/api/documents/extract', async (req: Request, res: Response) => {
-  const { fileName, fileContentBase64, documentType } = req.body;
-
-  // Use Gemini OCR if provided
-  let ocrPrompt = `Extract structured travel booking information from document named "${fileName || 'ticket.pdf'}".
-Return JSON with fields: bookingRef, travelerName, carrierOrProperty, origin, destination, dates, seatOrRoom, totalAmount, confidenceScore.`;
-
-  let extractedResult = {
-    bookingRef: `VISTAJET-${Math.floor(1000 + Math.random() * 9000)}`,
-    travelerName: 'Julian & Elena Vance',
-    carrierOrProperty: 'VistaJet Global Private',
-    origin: 'Zurich Kloten (LSZH)',
-    destination: 'Naples Capodichino (LIRN)',
-    dates: 'Oct 14, 2025 · 10:15 CET',
-    seatOrRoom: 'Master Stateroom Suite',
-    totalAmount: '₹9,08,000',
-    confidenceScore: 0.98,
-  };
-
   try {
-    const aiText = await generateGeminiText(ocrPrompt);
-    if (aiText) {
-      const jsonMatch = aiText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        extractedResult = { ...extractedResult, ...parsed };
+    const { fileName, fileContentBase64, mimeType, fileSize, documentType } = req.body;
+
+    if (!fileContentBase64) {
+      res.status(400).json({
+        success: false,
+        error: 'No document data provided. Base64 encoded file content is required.',
+      });
+      return;
+    }
+
+    // MIME type validation
+    const targetMime = (mimeType || 'application/pdf').toLowerCase();
+    const allowedMimes = ['application/pdf', 'image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+
+    if (!allowedMimes.includes(targetMime)) {
+      res.status(400).json({
+        success: false,
+        error: `Unsupported document format (${targetMime}). Only PDF, JPEG, PNG, and WEBP files are supported.`,
+      });
+      return;
+    }
+
+    // Call real Gemini multimodal extraction
+    const extracted = await extractTravelDocumentWithGemini(
+      fileContentBase64,
+      targetMime,
+      fileName || 'travel_document.pdf'
+    );
+
+    const docId = `doc-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const parsedTimestamp = new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
+
+    const documentRecord: any = {
+      id: docId,
+      fileName: fileName || 'Uploaded_Travel_Document.pdf',
+      fileSize: fileSize || '1.2 MB',
+      fileType: targetMime,
+      uploadedAt: new Date().toISOString(),
+      parsedAt: parsedTimestamp,
+      confidenceScore: extracted.confidenceScore,
+      documentType: documentType || extracted.documentType || 'flight_ticket',
+      fields: extracted.fields,
+      extractedData: {
+        bookingRef: extracted.fields.bookingReference || 'N/A',
+        travelerName: (extracted.fields.passengerNames && extracted.fields.passengerNames.length > 0)
+          ? extracted.fields.passengerNames.join(', ')
+          : 'Verified Guest',
+        carrierOrProperty: extracted.fields.carrierOrProperty || 'Confirmed Provider',
+        origin: extracted.fields.origin || 'Departure Hub',
+        destination: extracted.fields.destination || 'Target Sanctuary',
+        dates: extracted.fields.departureDate || 'Scheduled Dates',
+        seatOrRoom: extracted.fields.seatNumber || extracted.fields.flightOrRoomNumber || 'Assigned',
+        totalAmount: extracted.fields.pricePaid || 'Paid',
+        confidenceScore: extracted.confidenceScore,
+      },
+      rawSummary: extracted.rawSummary,
+      status: extracted.status,
+    };
+
+    // Attach to active trip in memory
+    if (tripsStore[0]) {
+      tripsStore[0].extractedDocuments = tripsStore[0].extractedDocuments || [];
+      tripsStore[0].extractedDocuments.unshift(documentRecord);
+      tripsStore[0].documents = tripsStore[0].documents || [];
+      tripsStore[0].documents.unshift(documentRecord);
+    }
+
+    res.json({
+      success: true,
+      document: documentRecord,
+      message: `Document ${fileName || ''} successfully parsed and extracted.`,
+    });
+  } catch (err: any) {
+    console.error('[Document Extraction Error]:', err);
+    res.status(500).json({
+      success: false,
+      error: 'Document extraction failed',
+      message: err?.message || 'Internal processing error',
+    });
+  }
+});
+
+/**
+ * 13b. PATCH /api/documents/:id
+ * Updates editable fields or status on an extracted document
+ */
+app.patch('/api/documents/:id', (req: Request, res: Response) => {
+  const docId = req.params.id;
+  const updates = req.body;
+
+  let found = false;
+  tripsStore.forEach((trip) => {
+    if (trip.extractedDocuments) {
+      const idx = trip.extractedDocuments.findIndex((d) => d.id === docId);
+      if (idx >= 0) {
+        trip.extractedDocuments[idx] = {
+          ...trip.extractedDocuments[idx],
+          ...updates,
+          fields: {
+            ...trip.extractedDocuments[idx].fields,
+            ...(updates.fields || {}),
+          },
+        };
+        found = true;
       }
     }
-  } catch (err) {
-    console.warn('OCR error, using validated fallback:', err);
-  }
-
-  const documentRecord = {
-    id: `doc-${Date.now()}`,
-    fileName: fileName || 'Uploaded_Travel_Document.pdf',
-    fileSize: '1.2 MB',
-    fileType: 'application/pdf',
-    uploadedAt: new Date().toISOString(),
-    confidenceScore: 0.98,
-    documentType: documentType || 'flight_ticket',
-    extractedData: extractedResult,
-    status: 'verified' as const,
-  };
-
-  // Attach to active trip
-  if (tripsStore[0]) {
-    tripsStore[0].documents = tripsStore[0].documents || [];
-    tripsStore[0].documents.unshift(documentRecord);
-  }
-
-  res.json({
-    success: true,
-    document: documentRecord,
   });
+
+  if (!found) {
+    res.status(404).json({ success: false, error: 'Document not found' });
+    return;
+  }
+
+  res.json({ success: true, message: 'Document updated successfully' });
+});
+
+/**
+ * 13c. DELETE /api/documents/:id
+ * Removes a document from active trip dossier
+ */
+app.delete('/api/documents/:id', (req: Request, res: Response) => {
+  const docId = req.params.id;
+  let removed = false;
+
+  tripsStore.forEach((trip) => {
+    if (trip.extractedDocuments) {
+      const initLen = trip.extractedDocuments.length;
+      trip.extractedDocuments = trip.extractedDocuments.filter((d) => d.id !== docId);
+      if (trip.extractedDocuments.length < initLen) removed = true;
+    }
+    if (trip.documents) {
+      trip.documents = trip.documents.filter((d: any) => d.id !== docId);
+    }
+  });
+
+  if (!removed) {
+    res.status(404).json({ success: false, error: 'Document not found' });
+    return;
+  }
+
+  res.json({ success: true, message: 'Document removed from trip dossier' });
 });
 
 /**
@@ -674,12 +814,13 @@ Return JSON with fields: bookingRef, travelerName, carrierOrProperty, origin, de
 app.get('/api/agent-center/metrics', async (req: Request, res: Response) => {
   try {
     const tripId = req.query.tripId as string;
+    const arch = req.query.architecture as 'multi_agent' | 'single_agent' | undefined;
     let targetTrip = tripId ? tripsStore.find((t) => t.id === tripId) : tripsStore[0];
     if (!targetTrip) {
       targetTrip = DEFAULT_ODYSSEY;
     }
 
-    const evaluation = await synthesizeEvaluationDataForTrip(targetTrip, PORT);
+    const evaluation = await synthesizeEvaluationDataForTrip(targetTrip, PORT, arch);
     res.json({
       success: true,
       metrics: evaluation,
@@ -723,7 +864,8 @@ app.post('/api/agent-center/test-ping', async (_req: Request, res: Response) => 
 app.post('/api/agent-center/evaluate-trip', async (req: Request, res: Response) => {
   try {
     const tripPayload: TripPlan = req.body?.trip || tripsStore[0] || DEFAULT_ODYSSEY;
-    const evaluation = await synthesizeEvaluationDataForTrip(tripPayload, PORT);
+    const arch = req.body?.architecture as 'multi_agent' | 'single_agent' | undefined;
+    const evaluation = await synthesizeEvaluationDataForTrip(tripPayload, PORT, arch);
     res.json({
       success: true,
       metrics: evaluation,
@@ -736,6 +878,218 @@ app.post('/api/agent-center/evaluate-trip', async (req: Request, res: Response) 
       message: err?.message,
     });
   }
+});
+
+// ================= ACADEMIC RESEARCH BENCHMARK API =================
+
+/**
+ * 17a. GET /api/benchmark/scenarios
+ * Returns the standardized 8 research scenarios
+ */
+app.get('/api/benchmark/scenarios', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    scenarios: BENCHMARK_SCENARIOS,
+  });
+});
+
+/**
+ * 17b. GET /api/benchmark/results
+ * Returns all persisted benchmark run records and comparative analysis
+ */
+app.get('/api/benchmark/results', (req: Request, res: Response) => {
+  const arch = req.query.architecture as 'multi_agent' | 'single_agent' | undefined;
+  const testCaseId = req.query.testCaseId as string | undefined;
+  const limit = Number(req.query.limit) || 0;
+
+  const records = getAllBenchmarkRecords({
+    architecture: arch,
+    testCaseId,
+    limit: limit > 0 ? limit : undefined,
+  });
+
+  const analysis = getComparativeAnalysis();
+
+  res.json({
+    success: true,
+    count: records.length,
+    records,
+    analysis,
+  });
+});
+
+/**
+ * 17c. POST /api/benchmark/run
+ * Executes a live benchmark for a specific scenario and architecture (or paired execution)
+ */
+app.post('/api/benchmark/run', async (req: Request, res: Response) => {
+  const { scenarioId, architecture = 'paired' } = req.body || {};
+  const targetScenarioId = scenarioId || BENCHMARK_SCENARIOS[0].id;
+
+  try {
+    if (architecture === 'paired') {
+      const pairedResult = await executePairedBenchmark(targetScenarioId, PORT);
+      const analysis = getComparativeAnalysis();
+      res.json({
+        success: true,
+        mode: 'paired',
+        multiAgent: pairedResult.multiAgent,
+        singleAgent: pairedResult.singleAgent,
+        analysis,
+      });
+    } else {
+      const arch = architecture === 'single_agent' ? 'single_agent' : 'multi_agent';
+      const record = await executeSingleBenchmark(targetScenarioId, arch, PORT);
+      const analysis = getComparativeAnalysis();
+      res.json({
+        success: true,
+        mode: 'single',
+        record,
+        analysis,
+      });
+    }
+  } catch (err: any) {
+    console.error('[Benchmark Run Error]:', err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to execute benchmark run',
+      message: err?.message,
+    });
+  }
+});
+
+/**
+ * 17d. POST /api/benchmark/batch
+ * Runs N paired iterations across the benchmark suite
+ */
+app.post('/api/benchmark/batch', async (req: Request, res: Response) => {
+  const { scenarioId, iterations = 1 } = req.body || {};
+  try {
+    const result = await executeBatchBenchmark({
+      scenarioId,
+      iterations: Math.min(30, Number(iterations) || 1),
+      port: PORT,
+    });
+    res.json({
+      success: true,
+      totalExecuted: result.executedCount,
+      pairedRunsCount: result.pairedRunsCount,
+      recordsCount: getAllBenchmarkRecords().length,
+      analysis: result.analysis,
+    });
+  } catch (err: any) {
+    console.error('[Benchmark Batch Run Error]:', err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to execute batch benchmark',
+      message: err?.message,
+    });
+  }
+});
+
+/**
+ * 17e. GET /api/benchmark/comparison
+ * Returns statistical comparison between architectures
+ */
+app.get('/api/benchmark/comparison', (_req: Request, res: Response) => {
+  const analysis = getComparativeAnalysis();
+  res.json({
+    success: true,
+    analysis,
+  });
+});
+
+/**
+ * 17f. GET /api/benchmark/registry
+ * Returns formal Metric Registry defining every recorded measurement
+ */
+app.get('/api/benchmark/registry', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    registry: METRIC_REGISTRY,
+  });
+});
+
+/**
+ * 17g. GET /api/benchmark/algorithms
+ * Returns theoretical and empirical algorithm complexity comparison catalog
+ */
+app.get('/api/benchmark/algorithms', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    algorithms: ALGORITHM_COMPLEXITY_COMPARISONS,
+  });
+});
+
+app.get('/api/benchmark/multi-agent-performance', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    data: getRegisteredMultiAgentPerformance(),
+  });
+});
+
+app.get('/api/benchmark/single-agent-performance', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    data: getSingleAgentPerformanceSummary(),
+  });
+});
+
+/**
+ * 17h. GET /api/benchmark/export
+ * Exports benchmark records as CSV, Side-by-Side Comparison CSV, Architecture-Specific CSV, Multi-Agent CSV, Single-Agent CSV, or JSON
+ */
+app.get('/api/benchmark/export', (req: Request, res: Response) => {
+  const format = ((req.query.format as string) || 'json').toLowerCase();
+
+  if (format === 'comparison_csv') {
+    const csvContent = exportComparisonAsCsv();
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="smart_ai_travel_comparison_matrix_${Date.now()}.csv"`);
+    res.send(csvContent);
+  } else if (format === 'multi_agent_csv') {
+    const csvContent = exportMultiAgentMetricsAsCsv();
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="smart_ai_travel_multi_agent_metrics_${Date.now()}.csv"`);
+    res.send(csvContent);
+  } else if (format === 'single_agent_csv') {
+    const csvContent = exportSingleAgentMetricsAsCsv();
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="smart_ai_travel_single_agent_metrics_${Date.now()}.csv"`);
+    res.send(csvContent);
+  } else if (format === 'test_cases_csv') {
+    const csvContent = exportTestCaseResultsAsCsv();
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="smart_ai_travel_test_case_results_${Date.now()}.csv"`);
+    res.send(csvContent);
+  } else if (format === 'arch_csv') {
+    const csvContent = exportArchitectureSpecificAsCsv();
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="smart_ai_travel_arch_specific_metrics_${Date.now()}.csv"`);
+    res.send(csvContent);
+  } else if (format === 'csv' || format === 'records_csv') {
+    const csvContent = exportBenchmarksAsCsv();
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="smart_ai_travel_benchmark_records_${Date.now()}.csv"`);
+    res.send(csvContent);
+  } else {
+    const jsonData = exportBenchmarksAsJson();
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="smart_ai_travel_benchmark_full_dataset_${Date.now()}.json"`);
+    res.json(jsonData);
+  }
+});
+
+/**
+ * 17i. POST /api/benchmark/clear
+ * Resets benchmark history back to initial baseline seeds
+ */
+app.post('/api/benchmark/clear', (_req: Request, res: Response) => {
+  clearBenchmarkHistory();
+  res.json({
+    success: true,
+    message: 'Benchmark history reset to initial calibrated baseline records',
+  });
 });
 
 // ================= VITE DEV OR STATIC SERVE =================

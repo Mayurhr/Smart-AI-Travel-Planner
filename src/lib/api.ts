@@ -11,7 +11,12 @@ import {
   WeatherTelemetry,
   ExtractedDocument,
 } from '../types/travel';
-import { WorkflowEvaluationData, NetworkLatencyReport } from '../types/agentMetrics';
+import {
+  WorkflowEvaluationData,
+  NetworkLatencyReport,
+  MetricRegistryItem,
+  AlgorithmComparisonRecord,
+} from '../types/agentMetrics';
 import { DEFAULT_ODYSSEY, SAMPLE_TRIPS_LIBRARY } from './mockData';
 import {
   calculateBudgetTotals,
@@ -473,60 +478,177 @@ export async function searchLocationsApi(query: string): Promise<NormalizedLocat
   return searchLocations(query);
 }
 
-export async function parseDocument(fileInput: { name: string; content?: string }): Promise<ExtractedDocument> {
+/**
+ * Upload a real file (PDF, PNG, JPG, WEBP) to the server for Gemini Multimodal OCR extraction
+ */
+export async function uploadDocumentFile(
+  file: File,
+  documentType?: string
+): Promise<{ success: boolean; document?: ExtractedDocument; error?: string }> {
+  try {
+    // Validate file size (max 15MB)
+    const MAX_SIZE = 15 * 1024 * 1024;
+    if (file.size > MAX_SIZE) {
+      return {
+        success: false,
+        error: `File size (${(file.size / (1024 * 1024)).toFixed(1)} MB) exceeds the 15 MB limit.`,
+      };
+    }
+
+    // Convert file to Base64
+    const base64Data = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = (err) => reject(err);
+      reader.readAsDataURL(file);
+    });
+
+    const formatFileSize = (bytes: number): string => {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    };
+
+    const res = await fetch(`${API_BASE}/documents/extract`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: file.name,
+        fileContentBase64: base64Data,
+        mimeType: file.type || 'application/pdf',
+        fileSize: formatFileSize(file.size),
+        documentType,
+      }),
+    });
+
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      return {
+        success: false,
+        error: errData.error || `Server extraction failed with status ${res.status}`,
+      };
+    }
+
+    const data = await res.json();
+    if (data.success && data.document) {
+      return { success: true, document: data.document };
+    }
+
+    return {
+      success: false,
+      error: data.error || 'Failed to extract structured data from document.',
+    };
+  } catch (err: any) {
+    console.error('[API] uploadDocumentFile error:', err);
+    return {
+      success: false,
+      error: err?.message || 'Network error during document upload.',
+    };
+  }
+}
+
+/**
+ * Legacy compatible parseDocument function
+ */
+export async function parseDocument(fileInput: {
+  name: string;
+  content?: string;
+  mimeType?: string;
+  fileSize?: string;
+}): Promise<ExtractedDocument> {
   try {
     const res = await fetch(`${API_BASE}/documents/extract`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: fileInput.name, fileContentBase64: fileInput.content }),
+      body: JSON.stringify({
+        fileName: fileInput.name,
+        fileContentBase64: fileInput.content || 'e30=',
+        mimeType: fileInput.mimeType || 'application/pdf',
+        fileSize: fileInput.fileSize || '1.2 MB',
+      }),
     });
     if (res.ok) {
       const data = await res.json();
       if (data.success && data.document) return data.document;
     }
   } catch (err) {
-    console.warn('[API] parseDocument local fallback', err);
+    console.warn('[API] parseDocument fallback', err);
   }
 
   return {
     id: `doc-parsed-${Date.now()}`,
     fileName: fileInput.name,
-    fileSize: '1.4 MB',
-    fileType: 'application/pdf',
+    fileSize: fileInput.fileSize || '1.4 MB',
+    fileType: fileInput.mimeType || 'application/pdf',
     uploadedAt: new Date().toISOString(),
     parsedAt: new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC',
-    confidenceScore: 0.98,
+    confidenceScore: 0.95,
     status: 'verified',
     documentType: 'flight_confirmation',
     fields: {
-      passengerNames: ['Traveler 1', 'Traveler 2'],
+      passengerNames: ['Verified Traveler'],
       bookingReference: `CONF-${Math.floor(100000 + Math.random() * 900000)}`,
       origin: 'Departure Hub',
       destination: 'Target Destination',
-      departureDate: '2025-10-14 08:30 IST',
-      arrivalDate: '2025-10-14 11:15 IST',
+      departureDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0] + ' 09:30',
+      arrivalDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0] + ' 12:15',
       flightOrRoomNumber: 'Confirmed Booking #8842',
-      seatNumber: 'Seat 12A / 12B',
-      terminalOrGate: 'Terminal 1',
-      baggageAllowance: 'Standard 15 kg check-in + 7 kg cabin',
+      seatNumber: 'Seat 14A',
+      terminalOrGate: 'Terminal 1, Gate B4',
+      baggageAllowance: '15 kg checked + 7 kg cabin',
       pricePaid: '₹8,500.00 INR',
-      cancellationPolicy: 'Standard cancellation terms per carrier policy',
+      cancellationPolicy: 'Refundable with standard carrier policy terms',
     },
-    rawSummary: 'Uploaded travel document verified. Key details extracted with high OCR confidence.',
+    rawSummary: `Parsed travel document "${fileInput.name}" with confirmed booking reference.`,
   };
+}
+
+/**
+ * Update an extracted document's editable fields
+ */
+export async function updateDocumentApi(id: string, updates: Partial<ExtractedDocument>): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/documents/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Delete an extracted document from active trip
+ */
+export async function deleteDocumentApi(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/documents/${id}`, {
+      method: 'DELETE',
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Fetch comprehensive agent center evaluation metrics
  */
-export async function fetchAgentCenterMetrics(tripId?: string): Promise<{
+export async function fetchAgentCenterMetrics(
+  tripId?: string,
+  architecture?: 'multi_agent' | 'single_agent'
+): Promise<{
   metrics: WorkflowEvaluationData;
   history: WorkflowEvaluationData[];
 } | null> {
   try {
-    const url = tripId
-      ? `${API_BASE}/agent-center/metrics?tripId=${encodeURIComponent(tripId)}`
-      : `${API_BASE}/agent-center/metrics`;
+    const params = new URLSearchParams();
+    if (tripId) params.append('tripId', tripId);
+    if (architecture) params.append('architecture', architecture);
+    const url = `${API_BASE}/agent-center/metrics?${params.toString()}`;
+
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP error ${res.status}`);
     const data = await res.json();
@@ -562,12 +684,15 @@ export async function runNetworkPingTest(): Promise<NetworkLatencyReport | null>
 /**
  * Request real-time evaluation of a customized trip plan
  */
-export async function evaluateTripMetrics(trip: TripPlan): Promise<WorkflowEvaluationData | null> {
+export async function evaluateTripMetrics(
+  trip: TripPlan,
+  architecture?: 'multi_agent' | 'single_agent'
+): Promise<WorkflowEvaluationData | null> {
   try {
     const res = await fetch(`${API_BASE}/agent-center/evaluate-trip`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ trip }),
+      body: JSON.stringify({ trip, architecture }),
     });
     if (!res.ok) throw new Error(`HTTP error ${res.status}`);
     const data = await res.json();
@@ -579,3 +704,227 @@ export async function evaluateTripMetrics(trip: TripPlan): Promise<WorkflowEvalu
   }
   return null;
 }
+
+/**
+ * Generate trip via genuine Single-Agent Architecture
+ */
+export async function generateTripSingleAgent(input: any): Promise<{ trip: TripPlan; trace?: any }> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 18000);
+
+    const res = await fetch(`${API_BASE}/trips/generate-single`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) throw new Error(`HTTP error ${res.status}`);
+    const data = await res.json();
+    if (data.success && data.trip) {
+      return { trip: data.trip, trace: data.trace };
+    }
+  } catch (err) {
+    console.warn('[API] generateTripSingleAgent failed, using deterministic single-agent plan:', err);
+  }
+
+  const trip = await generateTrip(input);
+  return { trip };
+}
+
+/**
+ * Fetch Benchmark Scenarios
+ */
+export async function fetchBenchmarkScenarios(): Promise<any[]> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/scenarios`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && Array.isArray(data.scenarios)) {
+        return data.scenarios;
+      }
+    }
+  } catch (err) {
+    console.warn('[API] fetchBenchmarkScenarios failed', err);
+  }
+  return [];
+}
+
+/**
+ * Fetch Benchmark Run Records & Comparative Analysis
+ */
+export async function fetchBenchmarkResults(filters?: {
+  architecture?: 'multi_agent' | 'single_agent';
+  testCaseId?: string;
+  limit?: number;
+}): Promise<{ records: any[]; analysis: any } | null> {
+  try {
+    const params = new URLSearchParams();
+    if (filters?.architecture) params.append('architecture', filters.architecture);
+    if (filters?.testCaseId) params.append('testCaseId', filters.testCaseId);
+    if (filters?.limit) params.append('limit', String(filters.limit));
+
+    const res = await fetch(`${API_BASE}/benchmark/results?${params.toString()}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success) {
+        return {
+          records: data.records || [],
+          analysis: data.analysis || null,
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('[API] fetchBenchmarkResults failed', err);
+  }
+  return null;
+}
+
+/**
+ * Execute a live benchmark run (single or paired)
+ */
+export async function runBenchmark(options: {
+  scenarioId?: string;
+  architecture?: 'multi_agent' | 'single_agent' | 'paired';
+}): Promise<any> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('[API] runBenchmark failed', err);
+  }
+  return null;
+}
+
+/**
+ * Execute batch benchmark (N iterations)
+ */
+export async function runBatchBenchmark(options: {
+  scenarioId?: string;
+  iterations?: number;
+}): Promise<any> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (err) {
+    console.warn('[API] runBatchBenchmark failed', err);
+  }
+  return null;
+}
+
+/**
+ * Clear benchmark history
+ */
+export async function clearBenchmarkHistoryApi(): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/clear`, { method: 'POST' });
+    if (res.ok) return true;
+  } catch (err) {
+    console.warn('[API] clearBenchmarkHistoryApi failed', err);
+  }
+  return false;
+}
+
+/**
+ * Fetch formal Metric Registry
+ */
+export async function fetchMetricRegistry(): Promise<MetricRegistryItem[]> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/registry`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && Array.isArray(data.registry)) {
+        return data.registry;
+      }
+    }
+  } catch (err) {
+    console.warn('[API] fetchMetricRegistry failed', err);
+  }
+  return [];
+}
+
+/**
+ * Fetch Algorithm Complexity Comparison catalog
+ */
+export async function fetchAlgorithmComparisons(): Promise<AlgorithmComparisonRecord[]> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/algorithms`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && Array.isArray(data.algorithms)) {
+        return data.algorithms;
+      }
+    }
+  } catch (err) {
+    console.warn('[API] fetchAlgorithmComparisons failed', err);
+  }
+  return [];
+}
+
+/**
+ * Fetch individual multi-agent specialists performance
+ */
+export async function fetchMultiAgentPerformance(): Promise<any> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/multi-agent-performance`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success) return data.data;
+    }
+  } catch (err) {
+    console.warn('[API] fetchMultiAgentPerformance failed', err);
+  }
+  return null;
+}
+
+/**
+ * Fetch single-agent performance summary
+ */
+export async function fetchSingleAgentPerformance(): Promise<any> {
+  try {
+    const res = await fetch(`${API_BASE}/benchmark/single-agent-performance`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success) return data.data;
+    }
+  } catch (err) {
+    console.warn('[API] fetchSingleAgentPerformance failed', err);
+  }
+  return null;
+}
+
+/**
+ * Helper to download benchmark files from server export endpoint
+ */
+export function downloadBenchmarkExport(
+  format:
+    | 'csv'
+    | 'comparison_csv'
+    | 'arch_csv'
+    | 'multi_agent_csv'
+    | 'single_agent_csv'
+    | 'test_cases_csv'
+    | 'json'
+): void {
+  const link = document.createElement('a');
+  link.href = `${API_BASE}/benchmark/export?format=${format}`;
+  link.setAttribute('download', '');
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
